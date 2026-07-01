@@ -1,135 +1,373 @@
-import asyncio
-import os
-import re
-import hashlib
-from urllib.parse import urljoin, urlparse
-from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
+# ==============================================================================
+# ИМПОРТ НЕОБХОДИМЫХ БИБЛИОТЕК
+# ==============================================================================
+import asyncio          # Для асинхронного выполнения, управления очередями и пулом воркеров
+import os               # Для работы с файловой системой (создание папок, сохранение файлов)
+import re               # Для регулярных выражений (поиск URL в CSS, фильтрация, паттерны Tilda)
+import hashlib          # Для генерации коротких хешей, если имя файла слишком длинное
+import urllib.parse     # Для декодирования URL (из %20 в пробел и т.д.) и работы с query-параметрами
+from urllib.parse import urljoin, urlparse # Для склеивания относительных ссылок и разбора URL на части
+from playwright.async_api import async_playwright # Асинхронный браузер для рендеринга JS и скачивания
+from bs4 import BeautifulSoup                 # Парсер HTML для поиска тегов, атрибутов и модификации DOM
 
-# --- НАСТРОЙКИ ---
-BASE_URL = "https://www.site.ru"
-BASE_DOMAIN = "site.ru" 
-START_URL = f"{BASE_URL}/main" 
+# ==============================================================================
+# --- БЛОК НАСТРОЕК (КОНФИГУРАЦИЯ) ---
+# ==============================================================================
 
-# 1. Папка сохранения
-parsed_base = urlparse(BASE_URL)
-OUTPUT_DIR = parsed_base.netloc
+# Стартовый URL, с которого начинается парсинг
+START_URL = "https://www.your.site/page1"
 
-MAX_PAGES = 500 
-CONCURRENT_TABS = 5  
-# -----------------
+# Автоматическое определение базового домена (например, https://www.your.site)
+_parsed_start_url = urlparse(START_URL)
+AUTO_BASE_URL = f"{_parsed_start_url.scheme}://{_parsed_start_url.netloc}"
 
-# Экранируем домен для безопасного использования в регулярном выражении
-escaped_domain = re.escape(BASE_DOMAIN)
+# Белые списки URL. Парсер будет скачивать только те страницы, которые начинаются с этих путей.
+BASE_URLS = [
+     AUTO_BASE_URL, # Раскомментируйте, чтобы скачивать весь домен
+#    START_URL,       # Скачивать только указанный раздел и его подразделы
+#    "https://www.your.site/page2",
+]
 
-URL_REGEX = re.compile(
-    rf'((?:https?:)?//(?:[a-z0-9-]+\.)*tildacdn\.com/[^\s"\'<>\)]+|'
-    rf'(?:https?:)?//(?:[a-z0-9-]+\.)*{escaped_domain}/[^\s"\'<>\)]+)'
-)
+# Черные списки URL. Парсер проигнорирует эти страницы, даже если найдет ссылки на них.
+BLOCK_URLS = [
+#    "https://www.your.site/page3",
+]
 
-EXT_MAP = {
+# Формирование имени папки, в которую будет сохранен сайт.
+# Пример: www.www.your.site_page1
+_path_part = urllib.parse.unquote(_parsed_start_url.path).strip('/').replace('/', '_')
+OUTPUT_DIR = f"{_parsed_start_url.netloc}_{_path_part}" if _path_part else _parsed_start_url.netloc
+
+# Ограничения и настройки поведения парсера
+MAX_PAGES = 500                 # Максимальное количество HTML-страниц для скачивания
+CONCURRENT_TABS = 5             # Количество одновременно открытых вкладок в браузере (потоков)
+DELAY_BETWEEN_REQUESTS = 0.2    # Задержка в секундах между запросами (имитация живого человека, защита от бана)
+
+# Домены, которые нужно игнорировать (аналитика, соцсети, трекеры, CDN форм).
+# Это экономит трафик и время, а также предотвращает скачивание мусора.
+EXCLUDE_DOMAINS = [
+    # --- Аналитика и Трекеры ---
+    'mc.yandex.ru', 'yandex.ru/metrika', 
+    'google-analytics.com', 'googletagmanager.com',
+    'hotjar.com', 'mixpanel.com', 'amplitude.com', 'segment.com', 'clarity.ms', 'bing.com/bat',
+    'api.vigo.tech', # Пуш-уведомления и аналитика Vigo
+    
+    # --- Реклама и RTB-сети ---
+    'doubleclick.net', 'adsrvr.org', 'adform.net', 'criteo.com', 'outbrain.com', 'taboola.com',
+    'ep2.adtrafficquality.google', # Google Ad Traffic Quality
+    'pic.rtbcdn.ru', # CDN рекламных сетей (RTB)
+    
+    # --- Соцсети и виджеты (с трекерами) ---
+    'facebook.com', 'facebook.net', 'vk.com', 'instagram.com', 'telegram.org', 't.me',
+    'mail.ru', 'ok.ru', 'twitter.com', 'x.com', 'linkedin.com', 'pinterest.com', 'tiktok.com',
+    'usocial.pro', # Виджеты соцсетей и SMM
+    
+    # --- Служебные системы Tilda (аналитика, спам-защита, формы) ---
+    'tilda.cc', 'api.tildacdn.com', 'forms.tildacdn.com', 'rec.tildacdn.com', 'stat.tildacdn.com',
+]
+
+# Расширения файлов, которые считаются HTML-страницами
+PAGE_EXTENSIONS = ['.html', '.htm', '.php', '.asp', '.aspx']
+
+# Расширения файлов, которые считаются статическими ассетами (картинки, документы, стили, скрипты)
+ASSET_EXTENSIONS = [
+    '.pdf', '.zip', '.rar', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', 
+    '.mp3', '.wav', '.mp4', '.webm', '.jpg', '.jpeg', '.png', '.gif', '.svg', 
+    '.webp', '.css', '.js', '.woff', '.woff2', '.ttf', '.eot'
+]
+
+# Словарь для определения расширения файла по его MIME-типу (если в URL нет расширения)
+MIME_TO_EXT_MAP = {
     'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 
     'image/svg+xml': '.svg', 'image/gif': '.gif',
     'text/css': '.css', 'application/javascript': '.js', 
-    'font/woff2': '.woff2', 'font/woff': '.woff', 'application/x-font-woff': '.woff'
+    'font/woff2': '.woff2', 'font/woff': '.woff', 'application/x-font-woff': '.woff',
+    'font/ttf': '.ttf', 'application/octet-stream': '.bin',
+    'video/mp4': '.mp4', 'video/webm': '.webm', 'audio/mpeg': '.mp3',
+    'application/pdf': '.pdf', 'application/zip': '.zip'
 }
 
-def is_api_or_external(url):
-    exclude = ['api.tildacdn', 'forms.tildacdn', 'rec.tildacdn', 'tilda.cc', 
-               'vk.com', 'facebook', 'instagram', 'telegram', 'mailto:', 'tel:', 
-               'yandex.ru/metrika', 'mc.yandex.ru', 'google-analytics']
-    return any(x in url for x in exclude)
+# Протоколы, которые не нужно скачивать (якоря, почта, телефоны, base64-картинки)
+IGNORED_PROTOCOLS = ('mailto:', 'tel:', 'javascript:', 'data:', 'blob:')
+IGNORED_HREF_PROTOCOLS = ('mailto:', 'tel:', 'javascript:', 'data:', 'blob:', '#')
 
-def sanitize_filename(name):
-    name = re.sub(r'[\\/*?:"<>|\r\n\t]', "_", name)
+# Атрибуты HTML-тегов, в которых могут скрываться ссылки на ассеты.
+# Включены специфичные атрибуты для Tilda и плагинов зума (data-img-zoom-url и т.д.)
+URL_ATTRIBUTES = [
+    'src', 'href', 'poster', 'data-original', 'data-src', 'data-bg', 
+    'data-image', 'data-lazy-src', 'data-img-zoom-url', 'data-zoom-image', 
+    'data-large-image', 'data-full', 'action', 'cite', 'background', 
+    'longdesc', 'usemap', 'dynsrc'
+]
+
+# Атрибуты, которые используются для ленивой загрузки (Lazy Load)
+LAZY_LOAD_ATTRIBUTES = ['data-original', 'data-src', 'data-bg', 'data-image', 'data-lazy-src']
+
+# Регулярное выражение для поиска url('...') внутри CSS-файлов и inline-стилей
+CSS_URL_REGEX = re.compile(r'url\(["\']?(.*?)["\']?\)')
+
+# Регулярные выражения для поиска специфичных блоков Tilda (карточки товаров, постов)
+TILDA_CARD_REGEX = re.compile(r"t-feed__[a-zA-Z0-9\-_]+post-wrapper|t-card__wrapper|t-product__wrapper")
+TILDA_IMG_REGEX = re.compile(r"t-feed__post-imgwrapper|t-bgimg|t-card__imgwrapper|t-product__imgwrapper")
+
+# Домены Tilda CDN. Нужны для фикса "сломанных" относительных путей, которые генерирует Tilda
+TILDA_CDN_DOMAINS = ['static.tildacdn.com', 'optim.tildacdn.com', 'static3.tildacdn.com', 'neo.tildacdn.com', 'tildacdn.com']
+
+# ==============================================================================
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# ==============================================================================
+
+def fix_tilda_relative_url(url, base_url):
+    """
+    Исправляет специфичные для Tilda "сломанные" относительные пути.
+    Tilda иногда генерирует пути вида `static.tildacdn.com/...` без протокола, 
+    что ломает стандартный urljoin. Эта функция вычленяет домен CDN и формирует корректный URL.
+    """
+    try:
+        parsed = urlparse(url)
+        base_netloc = urlparse(base_url).netloc
+        if parsed.netloc and parsed.netloc == base_netloc:
+            path_parts = parsed.path.strip('/').split('/')
+            if path_parts and any(tilda_domain in path_parts[0] for tilda_domain in TILDA_CDN_DOMAINS):
+                new_domain = path_parts[0]
+                new_path = '/'.join(path_parts[1:])
+                return f"https://{new_domain}/{new_path}"
+    except Exception:
+        pass
+    return url
+
+def safe_urljoin(base, url):
+    """Безопасное склеивание относительных и абсолютных URL с последующим фиксом багов Tilda."""
+    abs_url = urljoin(base, url)
+    return fix_tilda_relative_url(abs_url, base)
+
+def is_excluded(url):
+    """Проверяет, находится ли URL в черном списке доменов или использует игнорируемый протокол."""
+    if not url: return True
+    if url.startswith(IGNORED_PROTOCOLS): return True
+    return any(excl in url for excl in EXCLUDE_DOMAINS)
+
+def is_base_url(url):
+    """Проверяет, принадлежит ли URL к разрешенным базовым путям (белый список)."""
+    if not url.startswith('http'): return False
+    parsed_url = urlparse(url)
+    for base in BASE_URLS:
+        parsed_base = urlparse(base)
+        if parsed_url.netloc == parsed_base.netloc:
+            if parsed_url.path.startswith(parsed_base.path):
+                return True
+    return False
+
+def is_blocked_url(url):
+    """Проверяет, находится ли URL в жестком черном списке (BLOCK_URLS)."""
+    if not url.startswith('http'): return False
+    return any(url.startswith(block) for block in BLOCK_URLS)
+
+def should_download_html(url):
+    """Комплексная проверка: нужно ли скачивать эту страницу как HTML."""
+    if not url.startswith('http'): return False
+    if is_excluded(url): return False
+    if is_blocked_url(url): return False
+    if not is_base_url(url): return False
+    return True
+
+def sanitize_filename(name, is_query=False):
+    """
+    Очищает строку, чтобы её можно было использовать как имя файла или папки.
+    Удаляет недопустимые символы ОС, ограничивает длину и добавляет хеш, если имя слишком длинное.
+    """
+    if is_query:
+        name = urllib.parse.unquote_plus(name)
+        name = re.sub(r'[<>:"/\\|?*=&\x00-\x1F]', "_", name)
+    else:
+        name = urllib.parse.unquote(name)
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
+        
     name = name.rstrip('. ')
     if len(name) > 100:
-        name = name[:100] + "_" + hashlib.md5(name.encode()).hexdigest()[:8]
+        name = name[:100] + "_" + hashlib.md5(name.encode('utf-8')).hexdigest()[:8]
     return name
 
-def url_to_local_path(url):
+def _parse_url_parts(url):
+    """Разбирает URL на домен и путь, декодирует кириллицу (IDNA) и очищает имена."""
     parsed = urlparse(url)
-    path = parsed.path
-    
-    if not path or path == '/':
-        filename = "index.html"
-        if parsed.query: filename = f"index_{sanitize_filename(parsed.query)}.html"
-        return filename
-    
-    is_dir = path.endswith('/')
-    path = path.strip('/')
-    parts = path.split('/')
-    safe_parts = [sanitize_filename(p) or "_" for p in parts]
-        
-    if is_dir:
-        safe_parts.append("index.html")
-    else:
-        filename = safe_parts[-1]
-        name, ext = os.path.splitext(filename)
-        if not ext: filename = name + ".html"
-        if parsed.query: filename = f"{name}_{sanitize_filename(parsed.query)}.html"
-        safe_parts[-1] = filename
-        
-    return os.path.join(*safe_parts)
-
-async def download_asset(url, page, visited_assets):
-    if url in visited_assets:
-        return visited_assets[url]
-    
-    clean_url = url if url.startswith('http') else 'https:' + url
-    parsed = urlparse(clean_url)
-    
     domain = parsed.netloc
-    path = parsed.path.lstrip('/')
-    if not path: path = "index"
+    try:
+        domain = domain.encode('utf-8').decode('idna') # Поддержка кириллических доменов
+    except Exception:
+        pass
+    domain = sanitize_filename(domain)
+    path = urllib.parse.unquote(parsed.path).strip('/')
+    return parsed, domain, path
+
+def get_local_path_for_html(url):
+    """Генерирует локальный путь для сохранения HTML-страницы с учетом query-параметров."""
+    parsed, domain, path = _parse_url_parts(url)
     
+    if not path:
+        local_path = "index.html"
+        if parsed.query: local_path = f"index_{sanitize_filename(parsed.query, is_query=True)}.html"
+        return os.path.join(domain, local_path)
+        
     parts = path.split('/')
     safe_parts = [sanitize_filename(p) or "_" for p in parts]
     
     filename = safe_parts[-1]
     name, ext = os.path.splitext(filename)
     
-    safe_path = os.path.join(*safe_parts) if len(safe_parts) > 1 else safe_parts[0]
-    local_rel_path = os.path.join("assets", domain, safe_path)
+    if ext.lower() in PAGE_EXTENSIONS:
+        if parsed.query:
+            filename = f"{name}_{sanitize_filename(parsed.query, is_query=True)}{ext}"
+            safe_parts[-1] = filename
+    else:
+        safe_parts.append("index.html")
+        if parsed.query:
+            safe_parts[-1] = f"index_{sanitize_filename(parsed.query, is_query=True)}.html"
+            
+    return os.path.join(domain, *safe_parts)
+
+def get_local_path_for_asset(url):
+    """Генерирует локальный путь для сохранения ассета (картинки, CSS, PDF и т.д.)."""
+    parsed, domain, path = _parse_url_parts(url)
+    
+    if not path:
+        return os.path.join(domain, "index.bin")
+        
+    parts = path.split('/')
+    safe_parts = [sanitize_filename(p) or "_" for p in parts]
+    
+    return os.path.join(domain, *safe_parts)
+
+def extract_asset_urls(soup, base_url):
+    """
+    Извлекает ВСЕ возможные ссылки на ассеты из HTML-кода страницы.
+    Проверяет стандартные атрибуты, srcset, inline-стили и ссылки <a> на файлы.
+    """
+    urls = set()
+    
+    # 1. Сбор URL из ВСЕХ указанных атрибутов (включая data-img-zoom-url и lazy-load)
+    for tag in soup.find_all():
+        for attr in URL_ATTRIBUTES:
+            if tag.has_attr(attr):
+                if tag.name == 'a' and attr == 'href':
+                    continue # Ссылки <a href> обрабатываются отдельно как переходы на страницы
+                val = tag[attr]
+                if isinstance(val, list): continue
+                if val.startswith(IGNORED_PROTOCOLS): continue
+                urls.add(safe_urljoin(base_url, val))
+                
+    # 2. Обработка атрибута srcset (адаптивные изображения)
+    for tag in soup.find_all(srcset=True):
+        for part in tag['srcset'].split(','):
+            url = part.strip().split(' ')[0]
+            if url and not url.startswith(IGNORED_PROTOCOLS): 
+                urls.add(safe_urljoin(base_url, url))
+                
+    # 3. Поиск url() внутри inline-стилей (style="background-image: url(...)")
+    for tag in soup.find_all(style=True):
+        style_val = tag['style']
+        urls_in_style = CSS_URL_REGEX.findall(style_val)
+        for bg_url in urls_in_style:
+            if not bg_url or bg_url.startswith('data:') or bg_url.startswith('blob:'): continue
+            urls.add(safe_urljoin(base_url, bg_url))
+
+    # 4. Ссылки <a>, которые ведут напрямую на скачиваемые файлы (PDF, ZIP)
+    for a in soup.find_all('a', href=True):
+        ext = os.path.splitext(urlparse(a['href']).path)[1].lower()
+        if ext in ASSET_EXTENSIONS:
+            urls.add(safe_urljoin(base_url, a['href']))
+            
+    return urls
+
+async def download_asset(url, page, visited_assets, queue, visited_pages, queued_pages, visiting_assets=None):
+    """
+    Асинхронная функция скачивания ассетов.
+    - Рекурсивно скачивает CSS и парсит их на наличие шрифтов/картинок.
+    - Использует заголовки Referer для обхода защиты Tilda CDN от хотлинкинга (403 Forbidden).
+    - Защищена от циклических ссылок через visiting_assets.
+    """
+    if not url or url.startswith(IGNORED_PROTOCOLS):
+        return url
+        
+    if visiting_assets is None:
+        visiting_assets = set()
+        
+    if url in visited_assets:
+        return visited_assets[url] # Ассет уже скачан, возвращаем локальный путь
+        
+    if url in visiting_assets:
+        return url # Защита от рекурсии (циклических зависимостей в CSS)
+        
+    visiting_assets.add(url)
+    
+    clean_url = url if url.startswith('http') else 'https:' + url
+    if is_excluded(clean_url):
+        visiting_assets.discard(url)
+        return url
+        
+    local_rel_path = get_local_path_for_asset(clean_url)
     full_local_path = os.path.join(OUTPUT_DIR, local_rel_path)
     
     try:
-        resp = await page.request.get(clean_url)
-        if not resp.ok: return url
+        # ВАЖНО: Добавляем Referer и User-Agent для обхода защиты Tilda CDN от хотлинкинга (403 Forbidden)
+        headers = {
+            "Referer": START_URL, 
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        resp = await page.request.get(clean_url, headers=headers)
+        if not resp.ok: 
+            visiting_assets.discard(url)
+            return url
         content_bytes = await resp.body()
-        content_type = resp.headers.get('content-type', '').split(';')[0].strip()
+        content_type = resp.headers.get('content-type', '').split(';')[0].strip().lower()
     except Exception:
+        visiting_assets.discard(url)
         return url
         
-    if not ext:
-        ext = EXT_MAP.get(content_type, '')
-        filename = name + ext
-        safe_parts[-1] = filename
-        safe_path = os.path.join(*safe_parts) if len(safe_parts) > 1 else safe_parts[0]
-        local_rel_path = os.path.join("assets", domain, safe_path)
-        full_local_path = os.path.join(OUTPUT_DIR, local_rel_path)
+    # Если по ссылке на ассет вдруг пришел HTML, добавляем его в очередь на парсинг страниц
+    if 'html' in content_type:
+        html_path = get_local_path_for_html(clean_url)
+        visited_assets[url] = html_path
+        visited_assets[clean_url] = html_path
         
-    if len(filename) > 100:
-        filename = hashlib.md5(name.encode()).hexdigest() + ext
-        safe_parts[-1] = filename
-        safe_path = os.path.join(*safe_parts) if len(safe_parts) > 1 else safe_parts[0]
-        local_rel_path = os.path.join("assets", domain, safe_path)
+        if clean_url not in visited_pages and clean_url not in queued_pages:
+            if len(visited_pages) + len(queued_pages) < MAX_PAGES:
+                queued_pages.add(clean_url)
+                await queue.put(clean_url)
+                
+        visiting_assets.discard(url)
+        return html_path
+
+    # Если у файла нет расширения, определяем его по MIME-типу
+    name, ext = os.path.splitext(local_rel_path)
+    if not ext:
+        new_ext = MIME_TO_EXT_MAP.get(content_type, '.bin')
+        local_rel_path = name + new_ext
         full_local_path = os.path.join(OUTPUT_DIR, local_rel_path)
 
-    if 'css' in content_type or '.css' in local_rel_path:
+    # Глубокий парсинг CSS-файлов для скачивания вложенных ассетов (шрифты, фоны)
+    if 'css' in content_type or local_rel_path.endswith('.css'):
         css_text = content_bytes.decode('utf-8', errors='ignore')
-        css_urls = set(URL_REGEX.findall(css_text))
+        css_urls = set(CSS_URL_REGEX.findall(css_text))
         css_dir = os.path.dirname(local_rel_path)
         if not css_dir: css_dir = "."
         
         for css_url in css_urls:
-            if is_api_or_external(css_url): continue
-            inner_asset_path = await download_asset(css_url, page, visited_assets)
-            if inner_asset_path and inner_asset_path != css_url:
+            if not css_url or css_url.startswith('data:') or css_url.startswith('blob:'): continue
+            
+            abs_css_url = safe_urljoin(clean_url, css_url)
+            if is_excluded(abs_css_url): continue
+            
+            # Рекурсивный вызов для скачивания ресурса из CSS
+            inner_asset_path = await download_asset(abs_css_url, page, visited_assets, queue, visited_pages, queued_pages, visiting_assets)
+            if inner_asset_path and inner_asset_path != abs_css_url:
+                # Перезаписываем путь в CSS на локальный
                 rel_to_css = os.path.relpath(inner_asset_path, css_dir).replace('\\', '/')
-                css_text = css_text.replace(css_url, rel_to_css)
+                pattern = re.compile(r'url\(["\']?' + re.escape(css_url) + r'["\']?\)')
+                css_text = pattern.sub(f"url('{rel_to_css}')", css_text)
         content_bytes = css_text.encode('utf-8')
 
+    # Сохранение файла на диск
     dir_to_create = os.path.dirname(full_local_path)
     if dir_to_create: os.makedirs(dir_to_create, exist_ok=True)
         
@@ -138,11 +376,21 @@ async def download_asset(url, page, visited_assets):
         
     visited_assets[url] = local_rel_path
     visited_assets[clean_url] = local_rel_path
+    visiting_assets.discard(url)
     return local_rel_path
 
 async def process_page(page, url, visited_pages, queue, queued_pages, visited_assets):
+    """
+    Главная функция обработки HTML-страницы:
+    1. Загрузка и рендеринг JS.
+    2. Скролл для срабатывания Lazy Load.
+    3. Поиск ссылок на другие страницы.
+    4. Скачивание ассетов и замена URL в HTML на локальные.
+    5. Фикс специфичных багов Tilda и инъекция JS для зума.
+    """
     print(f"🔍 Обработка: {url}")
     try:
+        # Попытки загрузки страницы с обработкой таймаутов
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -155,6 +403,8 @@ async def process_page(page, url, visited_pages, queue, queued_pages, visited_as
                 else:
                     raise e 
         
+        # Имитация скролла страницы вниз. Это критически важно для сайтов с Lazy Load,
+        # чтобы JavaScript "подгрузил" картинки, которые изначально скрыты.
         await page.evaluate("""
             async () => {
                 await new Promise((resolve) => {
@@ -170,106 +420,198 @@ async def process_page(page, url, visited_pages, queue, queued_pages, visited_as
                 });
             }
         """)
-        await page.wait_for_timeout(1500) 
+        await page.wait_for_timeout(1500) # Ждем, чтобы картинки успели загрузиться
         
         original_html = await page.content()
         soup = BeautifulSoup(original_html, 'html.parser')
         
+        # Поиск ссылок <a> для добавления новых страниц в очередь парсинга
         for a in soup.find_all('a', href=True):
             href = a['href']
-            abs_url = urljoin(url, href).split('#')[0] 
-            if BASE_DOMAIN in abs_url and abs_url not in visited_pages and abs_url not in queued_pages and not is_api_or_external(abs_url):
-                queued_pages.add(abs_url)
-                await queue.put(abs_url)
+            abs_url = safe_urljoin(url, href).split('#')[0] 
+            ext = os.path.splitext(urlparse(abs_url).path)[1].lower()
+            
+            if ext not in ASSET_EXTENSIONS:
+                if should_download_html(abs_url):
+                    if abs_url not in visited_pages and abs_url not in queued_pages:
+                        if len(visited_pages) + len(queued_pages) < MAX_PAGES:
+                            queued_pages.add(abs_url)
+                            await queue.put(abs_url)
 
-        current_local_path = url_to_local_path(url)
+        current_local_path = get_local_path_for_html(url)
         current_dir = os.path.dirname(current_local_path)
         if not current_dir: current_dir = "."
 
-        asset_urls = set(URL_REGEX.findall(original_html))
-        replacements = {}
+        # Извлечение и скачивание всех ассетов (картинки, стили, скрипты)
+        asset_urls = extract_asset_urls(soup, url)
+        replacements = {} # Словарь для замены оригинальных URL на локальные пути
+        
         for asset_url in asset_urls:
-            if is_api_or_external(asset_url): continue
+            if is_excluded(asset_url): continue
             
-            clean_asset_url = asset_url if asset_url.startswith('http') else 'https:' + asset_url
-            parsed_asset = urlparse(clean_asset_url)
-            if BASE_DOMAIN in parsed_asset.netloc:
-                ext = os.path.splitext(parsed_asset.path)[1].lower()
-                allowed_extensions = ['.css', '.js', '.jpg', '.jpeg', '.png', '.webp', '.svg', '.gif', '.woff', '.woff2', '.ttf', '.eot', '.mp4', '.webm', '.pdf', '.ico']
-                if ext not in allowed_extensions:
-                    continue
-
-            local_path_root_rel = await download_asset(asset_url, page, visited_assets)
+            local_path_root_rel = await download_asset(asset_url, page, visited_assets, queue, visited_pages, queued_pages)
             if local_path_root_rel and local_path_root_rel != asset_url:
                 rel_to_html = os.path.relpath(local_path_root_rel, current_dir).replace('\\', '/')
                 replacements[asset_url] = rel_to_html
                 
-        final_html = original_html
-        for orig, local in replacements.items():
-            final_html = final_html.replace(orig, local)
+                # Добавляем варианты URL (без протокола, с https) для надежной замены в HTML
+                clean_asset_url = asset_url if asset_url.startswith('http') else 'https:' + asset_url
+                if asset_url.startswith('http'):
+                    no_proto = asset_url.replace('http:', '').replace('https:', '')
+                    replacements[no_proto] = rel_to_html
+                replacements[clean_asset_url] = rel_to_html
+                
+        # Повторный парсинг HTML для модификации
+        soup = BeautifulSoup(original_html, 'html.parser')
+        
+        def process_url_value(val, base_url, replacements, visited_assets):
+            """Вспомогательная функция для замены URL в атрибутах тегов."""
+            if not val or val.startswith(IGNORED_PROTOCOLS) or val.startswith('#'):
+                return val
+                
+            abs_val = safe_urljoin(base_url, val)
             
-        soup = BeautifulSoup(final_html, 'html.parser')
-        
-        # --- ИСПРАВЛЕНИЕ INLINE-СТИЛЕЙ (background-image) ---
-        for tag in soup.find_all(style=True):
-            style_val = tag['style']
-            urls_in_style = re.findall(r'url\(["\']?(.*?)["\']?\)', style_val)
-            for bg_url in urls_in_style:
-                if not bg_url or 'data:' in bg_url: continue
-                abs_bg_url = urljoin(url, bg_url).split('#')[0]
-                if BASE_DOMAIN in abs_bg_url or 'tildacdn.com' in abs_bg_url:
-                    if not is_api_or_external(abs_bg_url):
-                        local_path_root_rel = await download_asset(abs_bg_url, page, visited_assets)
-                        if local_path_root_rel and local_path_root_rel != abs_bg_url:
-                            rel_to_html = os.path.relpath(local_path_root_rel, current_dir).replace('\\', '/')
-                            style_val = style_val.replace(bg_url, rel_to_html)
-            tag['style'] = style_val
+            if abs_val in replacements: return replacements[abs_val]
+            if abs_val in visited_assets: return visited_assets[abs_val]
+                
+            if val.startswith('//'):
+                abs_val_https = 'https:' + val
+                if abs_val_https in replacements: return replacements[abs_val_https]
+                if abs_val_https in visited_assets: return visited_assets[abs_val_https]
+                
+            no_proto = abs_val.replace('http:', '').replace('https:', '')
+            if no_proto in replacements: return replacements[no_proto]
+            
+            return val
 
-        # --- МАГИЯ ДЛЯ TILDA: Чиним кликабельные карточки ---
-        card_regex = re.compile(r"t-feed__[a-zA-Z0-9\-_]+post-wrapper|t-card__wrapper|t-product__wrapper")
-        img_regex = re.compile(r"t-feed__post-imgwrapper|t-bgimg|t-card__imgwrapper|t-product__imgwrapper")
-        
-        for card in soup.find_all(class_=card_regex):
+        # Проход по всем тегам и замена URL в атрибутах (src, data-src, poster и т.д.)
+        for tag in soup.find_all():
+            for attr in URL_ATTRIBUTES:
+                if tag.has_attr(attr):
+                    if tag.name == 'a' and attr == 'href':
+                        continue 
+                        
+                    val = tag[attr]
+                    if isinstance(val, list): continue
+                        
+                    tag[attr] = process_url_value(val, url, replacements, visited_assets)
+                        
+            # Обработка srcset
+            if tag.has_attr('srcset'):
+                srcset = tag['srcset']
+                new_srcset = []
+                for part in srcset.split(','):
+                    part = part.strip()
+                    if not part: continue
+                    tokens = part.split()
+                    if not tokens: continue
+                    u = tokens[0]
+                    rest = ' '.join(tokens[1:])
+                    
+                    new_u = process_url_value(u, url, replacements, visited_assets)
+                        
+                    if rest: new_srcset.append(f"{new_u} {rest}")
+                    else: new_srcset.append(new_u)
+                tag['srcset'] = ', '.join(new_srcset)
+
+            # Обработка inline-стилей
+            if tag.has_attr('style'):
+                style_val = tag['style']
+                def replace_url_in_style(match):
+                    full_match = match.group(0)
+                    bg_url = match.group(1)
+                    if not bg_url: return full_match
+                    
+                    new_bg = process_url_value(bg_url, url, replacements, visited_assets)
+                    return f"url('{new_bg}')"
+                    
+                style_val = re.sub(CSS_URL_REGEX, replace_url_in_style, style_val)
+                tag['style'] = style_val
+
+        # СПЕЦИФИКА TILDA: Оборачиваем картинки в карточках в теги <a>, 
+        # чтобы при локальном просмотре они были кликабельными (как на оригинальном сайте).
+        for card in soup.find_all(class_=TILDA_CARD_REGEX):
             link = card.find('a', href=True)
             if link and link.get('href'):
                 href = link['href']
-                img_blocks = card.find_all(class_=img_regex)
+                img_blocks = card.find_all(class_=TILDA_IMG_REGEX)
                 for img_block in img_blocks:
                     if not img_block.find_parent('a'):
                         new_a = soup.new_tag('a', href=href, style="display:block; text-decoration:none; width:100%; height:100%;")
                         img_block.wrap(new_a)
 
-        # --- ИСПРАВЛЕНИЕ ВНУТРЕННИХ ССЫЛОК (<a>) ---
+        # Переносим картинки из data-src в src, чтобы они точно отображались без JS
+        for img in soup.find_all('img'):
+            data_orig = img.get('data-original') or img.get('data-src') or img.get('data-lazy-src')
+            if data_orig:
+                img['src'] = data_orig
+
+        # Обработка ссылок <a href> (переходы между скачанными HTML страницами)
         for a in soup.find_all('a', href=True):
             href = a['href']
-            if href.startswith('#') or href.startswith('mailto:') or href.startswith('tel:'):
+            if href.startswith(IGNORED_HREF_PROTOCOLS):
                 continue
-            abs_href = urljoin(url, href).split('#')[0] 
-            if BASE_DOMAIN in abs_href and not is_api_or_external(abs_href):
-                target_path = url_to_local_path(abs_href)
-                rel_to_html = os.path.relpath(target_path, current_dir).replace('\\', '/')
-                anchor = "#" + href.split("#", 1)[1] if "#" in href else ""
-                a['href'] = rel_to_html + anchor
-
-        # --- LAZY LOAD (data-original) ---
-        for el in soup.find_all(attrs={"data-original": True}):
-            local_url = el['data-original']
-            if local_url.startswith('http') or local_url.startswith('//'):
-                if not is_api_or_external(local_url):
-                    local_path_root_rel = await download_asset(local_url, page, visited_assets)
-                    if local_path_root_rel and local_path_root_rel != local_url:
-                        rel_to_html = os.path.relpath(local_path_root_rel, current_dir).replace('\\', '/')
-                        local_url = rel_to_html
             
-            if el.name == 'img': 
-                el['src'] = local_url 
-            else: 
-                current_style = el.get('style', '')
-                if 'background-image' not in current_style:
-                    el['style'] = f"background-image: url('{local_url}'); {current_style}"
+            abs_href = safe_urljoin(url, href)
+            anchor = ""
+            if "#" in abs_href:
+                abs_href, anchor = abs_href.split("#", 1)
+                anchor = "#" + anchor
                 
+            if abs_href in visited_assets:
+                target_path = visited_assets[abs_href]
+                rel_to_html = os.path.relpath(target_path, current_dir).replace('\\', '/')
+                a['href'] = rel_to_html + anchor
+                continue
+                
+            if should_download_html(abs_href):
+                target_path = get_local_path_for_html(abs_href)
+                rel_to_html = os.path.relpath(target_path, current_dir).replace('\\', '/')
+                a['href'] = rel_to_html + anchor
+                continue
+                
+            a['href'] = abs_href + anchor
+
+        # ИНЪЕКЦИЯ JS: Починка локального зума для Tilda.
+        # Родной скрипт зума Tilda не работает при открытии файлов через file:// из-за CORS.
+        # Мы внедряем свой легковесный скрипт, который перехватывает клик и показывает оверлей.
+        zoom_fix_js = """
+<script>
+(function() {
+    document.addEventListener('click', function(e) {
+        const img = e.target.closest('.t-zoomable, img[data-img-zoom-url], .t760__img');
+        if (img && img.tagName === 'IMG') {
+            e.preventDefault();
+            e.stopPropagation();
+            
+            let zoomUrl = img.getAttribute('data-img-zoom-url') || img.getAttribute('src');
+            if (!zoomUrl) return;
+            
+            const overlay = document.createElement('div');
+            overlay.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.95);z-index:999999;display:flex;justify-content:center;align-items:center;cursor:zoom-out;animation:fadeInZoom 0.3s ease-out;";
+            
+            const fullImg = document.createElement('img');
+            fullImg.src = zoomUrl;
+            fullImg.style.cssText = "max-width:90%;max-height:90%;object-fit:contain;box-shadow:0 10px 30px rgba(0,0,0,0.5);border-radius:4px;";
+            
+            overlay.appendChild(fullImg);
+            overlay.onclick = function() { overlay.remove(); };
+            document.body.appendChild(overlay);
+        }
+    }, true);
+    
+    const style = document.createElement('style');
+    style.innerHTML = "@keyframes fadeInZoom { from { opacity: 0; } to { opacity: 1; } }";
+    document.head.appendChild(style);
+})();
+</script>
+"""
+        if soup.find('body'):
+            soup.find('body').append(BeautifulSoup(zoom_fix_js, 'html.parser'))
+
         final_html = str(soup)
 
+        # Финальное сохранение модифицированной HTML-страницы на диск
         filepath = os.path.join(OUTPUT_DIR, current_local_path)
         dir_to_create = os.path.dirname(filepath)
         if dir_to_create: os.makedirs(dir_to_create, exist_ok=True)
@@ -281,39 +623,49 @@ async def process_page(page, url, visited_pages, queue, queued_pages, visited_as
     except Exception as e:
         print(f"❌ Ошибка на {url}: {e}")
 
-async def worker(worker_id, queue, context, visited_pages, queued_pages, visited_assets):
+async def worker(worker_id, page, queue, context, visited_pages, queued_pages, visited_assets):
+    """
+    Функция-воркер. Берет задачи из очереди и обрабатывает их.
+    Здесь настраивается перехват сетевых запросов (route.abort), чтобы браузер 
+    даже не тратил время на загрузку трекеров, аналитики и рекламы.
+    """
+    await page.route("**/*", lambda route: route.abort() if is_excluded(route.request.url) else route.continue_())
+    
     while True:
         url = await queue.get()
-        if url is None: break
+        if url is None: # Сигнал к завершению работы воркера
+            queue.task_done()
+            break
             
         if url in visited_pages:
             queue.task_done()
             continue
             
         visited_pages.add(url)
-        page = await context.new_page()
-        
-        await page.route("**/*", lambda route: route.abort() if any(x in route.request.url for x in [
-            "mc.yandex.ru", "google-analytics", "googletagmanager", "facebook", "vk.com", "tilda.cc", "stat.tildacdn"
-        ]) else route.continue_())
         
         try:
-            if len(visited_pages) <= MAX_PAGES:
-                await process_page(page, url, visited_pages, queue, queued_pages, visited_assets)
+            await process_page(page, url, visited_pages, queue, queued_pages, visited_assets)
+            await asyncio.sleep(DELAY_BETWEEN_REQUESTS) # Вежливая пауза
         except Exception as e:
             print(f"❌ Критическая ошибка в потоке {worker_id}: {e}")
         finally:
-            await page.close()
             queue.task_done()
 
 async def main():
+    """
+    Точка входа. Инициализирует браузер, создает пул вкладок, запускает воркеров.
+    После завершения скачивания генерирует красивую HTML-страницу-лаунчер.
+    """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True) # Запуск без графического интерфейса
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
+        
+        # Создаем несколько независимых вкладок для параллельного скачивания
+        pages = [await context.new_page() for _ in range(CONCURRENT_TABS)]
         
         queue = asyncio.Queue()
         await queue.put(START_URL)
@@ -323,10 +675,16 @@ async def main():
         visited_assets = {} 
         
         print(f"🚀 Запускаем {CONCURRENT_TABS} параллельных потоков...")
-        workers = [asyncio.create_task(worker(i, queue, context, visited_pages, queued_pages, visited_assets)) for i in range(CONCURRENT_TABS)]
+        workers = [
+            asyncio.create_task(
+                worker(i, pages[i], queue, context, visited_pages, queued_pages, visited_assets)
+            ) for i in range(CONCURRENT_TABS)
+        ]
         
+        # Ждем, пока все страницы и ассеты не будут обработаны
         await queue.join()
         
+        # Отправляем сигнал "None" каждому воркеру, чтобы они корректно завершили цикл while True
         for _ in range(CONCURRENT_TABS):
             await queue.put(None)
         await asyncio.gather(*workers)
@@ -334,17 +692,22 @@ async def main():
         await browser.close()
         print(f"\n🎉 Готово! Скачано страниц: {len(visited_pages)}. Папка: {OUTPUT_DIR}")
 
-    # --- ГЕНЕРАЦИЯ HTML-ЗАСТАВКИ ---
-    start_filename = url_to_local_path(START_URL).replace('\\', '/')
+    # ==============================================================================
+    # ГЕНЕРАЦИЯ КРАСИВОЙ СТАРТОВОЙ СТРАНИЦЫ (ЛАУНЧЕРА)
+    # ==============================================================================
     
-    # 2. Формируем динамическое имя для Лаунчера на основе START_URL
-    parsed_start = urlparse(START_URL)
-    start_path_str = parsed_start.path.strip('/').replace('/', '_')
-    if parsed_start.query:
-        start_path_str += "_" + sanitize_filename(parsed_start.query)
+    start_filename = get_local_path_for_html(START_URL).replace('\\', '/')
     
-    launcher_filename = f"!Запуск_{parsed_start.netloc}_{start_path_str}.html"
+    start_path_str = urllib.parse.unquote(_parsed_start_url.path).strip('/')
+    start_path_str = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", start_path_str).replace('/', '_')
+    if _parsed_start_url.query:
+        start_path_str += "_" + sanitize_filename(_parsed_start_url.query, is_query=True)
+    if not start_path_str:
+        start_path_str = "index"
+    
+    launcher_filename = f"!Запуск_{_parsed_start_url.netloc}_{start_path_str}.html"
 
+    # HTML-код лаунчера с современным дизайном, таймером обратного отсчета и автоматическим редиректом
     launcher_html = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -475,6 +838,7 @@ async def main():
 </body>
 </html>"""
 
+    # Сохранение лаунчера в корень папки со скачанным сайтом
     launcher_path = os.path.join(OUTPUT_DIR, launcher_filename)
     with open(launcher_path, 'w', encoding='utf-8') as f:
         f.write(launcher_html)
